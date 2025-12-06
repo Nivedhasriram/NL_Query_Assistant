@@ -1,0 +1,13 @@
+version: "3.8"
+services:
+  hive:
+    image: apache/hive:4.0.0
+    container_name: hive4
+    ports:
+      - "10000:10000"   # HiveServer2 (Thrift)
+      - "10002:10002"
+    environment:
+      - SERVICE_NAME=hiveserver2
+    volumes:
+      - ./hive-data:/opt/hive/data/warehouse
+    restart: unless-stopped

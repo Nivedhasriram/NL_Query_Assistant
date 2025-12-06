@@ -1,0 +1,11 @@
+llama-cpp-python==0.1.*     # wrapper for llama.cpp
+#gpt4all==0.4.*              # python binding to GPT4All (optional)
+transformers>=4.30.0
+torch>=2.0.0
+pyhive==0.6.4               # connect to HiveServer2 via Thrift
+thrift==0.14.1
+sqlparse
+pandas
+sql_metadata
+fastapi   # optional for web UI
+uvicorn

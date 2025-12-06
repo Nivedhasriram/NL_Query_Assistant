@@ -1,0 +1,208 @@
+# app/main.py
+"""
+NL -> Hive pipeline orchestrator
+- Uses available LLM wrappers (OpenAI, Gemini, local wrappers if present)
+- Generates 3 candidate HiveQL queries, ranks them, and executes the best on Hive
+- Safe defaults: will add LIMIT to SELECTs; supports a stub mode for testing without LLMs
+
+Usage:
+    source .venv/bin/activate
+    export OPENAI_API_KEY="sk-..."          # optional
+    export GOOGLE_GENAI_API_KEY="AIza..."   # optional OR use ADC
+    python app/main.py --nl "Top products by revenue in the demo sales table"
+"""
+
+import os
+import re
+import argparse
+import time
+from typing import List, Tuple
+
+# Load dotenv if present (optional)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+# Import wrappers and clients (these imports may raise if optional libs missing)
+from app.llm_wrappers import (
+    OpenAIWrapper,
+    GeminiWrapper,
+)
+# Local wrappers (if you kept them in the same file) will be imported too; handle missing gracefully
+try:
+    from llm_wrappers import LlamaWrapper, GPT4AllWrapper, HFWrapper
+except Exception:
+    LlamaWrapper = GPT4AllWrapper = HFWrapper = None
+
+from hive_client import HiveClient
+from comparator import rank_candidates
+
+# ---------- Config ----------
+DEFAULT_SCHEMA = "TABLE nl2hive_demo.sales(product_id string, price double, quantity int, sale_date string);"
+# Which hive host/port to use
+HIVE_HOST = os.getenv("HIVE_HOST", "127.0.0.1")
+HIVE_PORT = int(os.getenv("HIVE_PORT", "10000"))
+
+# If you want to force stub outputs for testing set USE_STUB=1 in env
+USE_STUB = os.getenv("USE_STUB", "0") == "1"
+
+# default chosen OpenAI/Gemini models (change if you have other model ids)
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+# ---------- Helpers ----------
+SQL_START_RE = re.compile(r"(SELECT|WITH|CREATE|INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER)[\s\S]*", re.IGNORECASE)
+
+def extract_sql(candidate_text: str) -> str:
+    """Extract probable SQL statement from model output using regex fallback."""
+    if not candidate_text:
+        return ""
+    m = SQL_START_RE.search(candidate_text)
+    if m:
+        return m.group(0).strip()
+    # fallback: return the full text (trim)
+    return candidate_text.strip()
+
+def ensure_select_limit(sql: str, default_limit: int = 100) -> str:
+    """If SQL is a SELECT and has no LIMIT, append a safe LIMIT."""
+    if not sql:
+        return sql
+    if sql.strip().upper().startswith("SELECT") and "LIMIT" not in sql.upper():
+        return sql.rstrip().rstrip(";") + f" LIMIT {default_limit}"
+    return sql
+
+def build_prompt(nl: str, schema_text: str) -> str:
+    from app.prompts import nl_to_hive_prompt
+    return nl_to_hive_prompt(nl, schema_text)
+
+# ---------- Translator orchestrator ----------
+def instantiate_translators() -> List[Tuple[str, object]]:
+    translators = []
+
+    # OpenAI
+    try:
+        if os.getenv("OPENAI_API_KEY"):
+            translators.append(("openai", OpenAIWrapper(model=OPENAI_MODEL)))
+        else:
+            print("[info] OPENAI_API_KEY not set; skipping OpenAIWrapper")
+    except Exception as e:
+        print(f"[warn] OpenAIWrapper not available: {e}")
+
+    # Gemini (Google GenAI)
+    try:
+        # Try to instantiate even if no explicit API key; client may use ADC
+        translators.append(("gemini", GeminiWrapper(model=GEMINI_MODEL, api_key=os.getenv("GOOGLE_GENAI_API_KEY"))))
+    except Exception as e:
+        print(f"[warn] GeminiWrapper not available: {e}")
+
+    # Local LLM wrappers (optional)
+    try:
+        if LlamaWrapper:
+            llama_path = os.getenv("LLAMA_MODEL_PATH")
+            if llama_path:
+                translators.append(("llama", LlamaWrapper(model_path=llama_path)))
+            else:
+                print("[info] LLAMA_MODEL_PATH not set; skipping LlamaWrapper")
+    except Exception as e:
+        print(f"[warn] LlamaWrapper failed to init: {e}")
+
+    try:
+        if GPT4AllWrapper:
+            g4_path = os.getenv("GPT4ALL_MODEL_PATH", "gpt4all-model.bin")
+            translators.append(("gpt4all", GPT4AllWrapper(model_name=g4_path)))
+    except Exception as e:
+        print(f"[warn] GPT4AllWrapper failed to init: {e}")
+
+    try:
+        if HFWrapper:
+            hf_model = os.getenv("HF_MODEL_NAME")
+            if hf_model:
+                translators.append(("hf", HFWrapper(model_name=hf_model)))
+    except Exception as e:
+        print(f"[warn] HFWrapper failed to init: {e}")
+
+    return translators
+
+# ---------- Main flow ----------
+def run_pipeline(nl: str, schema_text: str):
+    print("[info] Starting NL->Hive pipeline")
+    prompt = build_prompt(nl, schema_text)
+    hive = HiveClient(host=HIVE_HOST, port=HIVE_PORT)
+    candidates = []
+
+    if USE_STUB:
+        print("[info] Using STUB mode for candidate SQLs (no LLM calls)")
+        candidates = [
+            "SELECT product_id, SUM(price * quantity) as revenue FROM nl2hive_demo.sales GROUP BY product_id ORDER BY revenue DESC LIMIT 10;",
+            "SELECT product_id, SUM(price*quantity) revenue FROM nl2hive_demo.sales GROUP BY product_id ORDER BY revenue DESC LIMIT 5;",
+            "SELECT product_id, SUM(price*quantity) as revenue FROM sales GROUP BY product_id ORDER BY revenue DESC;"
+        ]
+    else:
+        translators = instantiate_translators()
+        if not translators:
+            print("[warn] No translators available. Set USE_STUB=1 to test the pipeline without LLMs.")
+            return
+
+        # Call each translator sequentially (safe and simple). You can parallelize if desired.
+        for name, t in translators:
+            try:
+                print(f"[info] Asking translator: {name}")
+                out = t.generate(prompt, max_tokens=512)
+                sql_candidate = extract_sql(out)
+                print(f"[{name}] candidate:\n{sql_candidate}\n---")
+                if sql_candidate:
+                    candidates.append(sql_candidate)
+            except Exception as e:
+                print(f"[warn] generation failed for {name}: {e}")
+
+    if not candidates:
+        print("[error] No candidate SQLs produced. Aborting.")
+        return
+
+    # Rank candidates using comparator (which runs syntax/explain checks)
+    print("[info] Ranking candidate queries...")
+    scored = rank_candidates(candidates, hive_client=hive)
+    for sql, score in scored:
+        print(f"score={score} sql={sql}")
+
+    best_sql, best_score = scored[0]
+    print(f"[info] Best SQL (score={best_score}):\n{best_sql}")
+
+    # Safety: add LIMIT to SELECTs if not present
+    exec_sql = ensure_select_limit(best_sql, default_limit=100)
+
+    print("[info] Dry-run EXPLAIN (safe) and then execute")
+    try:
+        explain_text = hive.explain(exec_sql)
+        print("[info] EXPLAIN output (first 1000 chars):")
+        print(explain_text[:1000])
+    except Exception as e:
+        print(f"[warn] EXPLAIN failed: {e} (continuing to attempt execution with caution)")
+
+    # Execute and fetch
+    try:
+        df = hive.execute(exec_sql, fetch=True)
+        if df is not None:
+            print("[info] Query result (head):")
+            # Print a reasonable number of rows
+            print(df.head(50).to_string(index=False))
+        else:
+            print("[info] Query executed (no fetch).")
+    except Exception as e:
+        print(f"[error] Execution failed: {e}")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--nl", required=True, help="Natural language query")
+    parser.add_argument("--schema", default=DEFAULT_SCHEMA, help="Database schema to include in prompt")
+    args = parser.parse_args()
+
+    # run
+    t0 = time.time()
+    run_pipeline(args.nl, args.schema)
+    print(f"[info] Done. Elapsed {time.time()-t0:.2f}s")
+
+if __name__ == "__main__":
+    main()
