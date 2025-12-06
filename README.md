@@ -18,31 +18,6 @@ The system uses **LLMs for query generation**, validates queries using Hive’s 
 
 ---
 
-## 🏗️ System Architecture
-
-User (Natural Language)
-↓
-Frontend / CLI
-↓
-Prompt Builder + Schema Injection
-↓
-LLM Translators (Gemini, DeepSeek)
-↓
-Candidate SQL Queries
-↓
-Comparator (EXPLAIN + Scoring)
-↓
-Best SQL Query
-↓
-Hive Execution (HiveServer2)
-↓
-Query Results
-
----
-
-
----
-
 ## 🧠 LLMs Used
 
 | Model | Platform | Role |
@@ -79,21 +54,6 @@ docker ps
 python app/generate_sales_data.py
 docker cp data/sales_full.csv hive4:/tmp/sales_full.csv
 
-
-Inside Hive:
-
-CREATE DATABASE nl2hive_demo;
-USE nl2hive_demo;
-
-CREATE TABLE sales (
-  product_id STRING,
-  price DOUBLE,
-  quantity INT,
-  sale_date STRING
-);
-
-LOAD DATA LOCAL INPATH '/tmp/sales_full.csv' INTO TABLE sales;
-
 🔐 Environment Variables
 
 export GOOGLE_GENAI_API_KEY="your_gemini_key"
@@ -104,8 +64,10 @@ export HF_TOKEN="your_huggingface_token"
 ▶️ Running the Project
 
 CLI Mode
+
 python -m app.main --nl "Top products by revenue in the demo sales table"
 
 Web UI
+
 export FLASK_APP=app.webapp
 flask run
